@@ -1,0 +1,17 @@
+############################################################################
+#   This role is used to setup centos 7 linux machine to install percona using 
+#   percona YUM Repository
+#   Created By: UK, 11-23-2105      
+############################################################################
+# ===> upgrade all packages
+#- name: upgrade all packages
+#  yum: name=* state=latest
+
+# ====> Install required packages
+- name: Install required centos packages
+  yum: name={{ item }} state=present
+  with_items: packages_list
+- name: Disable SELinux
+  selinux: state=disabled
+- name: Disable Firewall Deamon (iptables)
+  service: name=firewalld state=stopped enabled=no
