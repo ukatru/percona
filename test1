@@ -17,22 +17,21 @@ V_SCHEMA varchar(50) ;
 V_INSERT_TEMPLATE varchar(10485760);
 v_text varchar(100);
 V_ROW_UPDATE_BY_NM varchar(200);
+V_INSERT_COLS varchar(10485760);
+V_SELECT_COLS varchar(10485760);
+V_DW_INS_UPD_BY varchar(300) default  $$'fn_ups_merge_insert'$$;
+V_DW_INS_UPD_DATE varchar(50) default 'now()';
 begin
 	
 	V_SCHEMA = current_schema();
 	
   	V_INSERT_TEMPLATE = '
     INSERT INTO ##SchemaName##.##TargetTableName## (
-        ##ColumnList##,
-		##AuditColumns##
+        ##ColumnList##
      )
         SELECT 
-			##ColumnList##,
-			current_user,
-			now(),
-			current_user,
-			now()
-       	FROM ##SchemaName##.##SourceTableName## AS s
+			##SelectList##
+       	FROM ##SchemaName##.##SourceTableName## AS src
     	WHERE NOT EXISTS (
         	SELECT * FROM ##SchemaName##.##TargetTableName##
         	WHERE ##JoinCondition##
@@ -41,41 +40,80 @@ begin
     V_INSERT_TEMPLATE = REPLACE(V_INSERT_TEMPLATE,'##SchemaName##',V_SCHEMA);
 	V_INSERT_TEMPLATE = REPLACE(V_INSERT_TEMPLATE,'##SourceTableName##',I_SOURCE_TABLE_NAME);
 	V_INSERT_TEMPLATE = REPLACE(V_INSERT_TEMPLATE,'##TargetTableName##',I_TARGET_TABLE_NAME);
-    V_INSERT_TEMPLATE = REPLACE(V_INSERT_TEMPLATE, '##ColumnList##', (
-    	select string_agg(column_name,
-			',' || chr(13) || chr(10) || '    ' order by ordinal_position) from (
-		select ups.column_name as column_name, tgt.ordinal_position as ordinal_position from information_schema.columns ups
+	  with ups_col_list as(
+select ups.column_name, ups.table_name from information_schema.columns ups
 			inner join information_schema.columns tgt
 			on ups.column_name = tgt.column_name
 			and ups.table_schema = tgt.table_schema
 			where ups.table_name = I_SOURCE_TABLE_NAME
 			and tgt.table_name = I_TARGET_TABLE_NAME
-		) a )) ;
-	 V_INSERT_TEMPLATE = REPLACE(V_INSERT_TEMPLATE, '##JoinCondition##', (
-		SELECT string_agg(attname || '= s.' || attname, chr(13) || chr(10) || 'AND ' ) 
+)
+,date_cols as
+(
+ select i_insert_date_name as col_name where i_insert_date_name is not null
+ union select i_update_date_name as col_name where i_update_date_name is not null
+ union select 'DW_UPDATE_DATE' as col_name where i_update_date_name is null
+ union select 'DW_INSERT_DATE' as col_name where i_insert_date_name is  null
+ union select 'row_update_date' as col_name where i_update_date_name is  null
+  union select 'row_insert_dat' as col_name where i_insert_date_name is  null
+ )
+ ,by_cols as
+(
+ select i_insert_by_name as col_name where i_insert_by_name is not null
+ union select i_update_by_name as col_name where i_update_by_name is not null
+ union select 'DW_UPDATE_BY' as col_name where i_update_by_name is  null
+ union select 'DW_INSERT_BY' as col_name where i_insert_by_name is  null
+ union select 'row_update_by' as col_name where i_update_by_name is null
+  union select 'row_insert_by' as col_name where i_insert_by_name is  null
+ )
+ , col_list_all as
+ (-- all column list from tgt table including DW% and row%
+ select tgt.column_name as tgt_column,
+ 	 	ups.column_name as src_column,
+ 	 	case when ups.column_name is null and tgt.column_name in (select col_name from date_cols) then 1
+ 	 		 else 0
+ 	 	end as IS_DW_DATE_COLUMN,
+ 	 	case when ups.column_name is null and tgt.column_name in (select col_name from by_cols ) then 1
+ 	 		else 0
+ 	 	end as IS_DW_USER_COLUMN
+  from information_schema.columns tgt
+  		left join ups_col_list ups	
+  		 on tgt.column_name = ups.column_name
+  where tgt.table_name = I_TARGET_TABLE_NAME
+  	and (ups.column_name is not null
+  		or
+  		tgt.column_name in (
+  			select col_name from date_cols
+  			union all
+  			select col_name from by_cols)
+  		)
+ ) -- select * from col_list_all;
+ ,col_list_final as
+(
+select tgt_column ,
+	case when is_dw_user_column = 1 then V_DW_INS_UPD_BY
+		 when is_dw_date_column = 1 then V_DW_INS_UPD_DATE
+		 else case when src_column is null then 'NULL' else 'src.' || src_column end
+	end as SRC_COLUMN
+from col_list_all
+) -- select * from col_list_final
+select string_agg(tgt_column,
+			',' || chr(13) || chr(10) )   as INSERT_INTO_COL_LIST,
+		string_agg(src_column,
+			',' || chr(13) || chr(10) )   as SELECT_COL_LIST
+			into V_INSERT_COLS,
+			V_SELECT_COLS
+			from col_list_final;
+    V_INSERT_TEMPLATE = REPLACE(V_INSERT_TEMPLATE, '##ColumnList##', V_INSERT_COLS);
+   	V_INSERT_TEMPLATE = REPLACE(V_INSERT_TEMPLATE, '##SelectList##', V_SELECT_COLS);
+	V_INSERT_TEMPLATE = REPLACE(V_INSERT_TEMPLATE, '##JoinCondition##', (
+		SELECT string_agg(attname || '= src.' || attname, chr(13) || chr(10) || 'AND ' ) 
 			FROM   pg_index i
 			JOIN   pg_attribute a ON a.attrelid = i.indrelid
              		AND a.attnum = ANY(i.indkey)
 			WHERE  i.indrelid = (V_SCHEMA||'.'||I_TARGET_TABLE_NAME)::regclass
 			AND    i.indisprimary)
 		);
-	 V_INSERT_TEMPLATE = REPLACE(V_INSERT_TEMPLATE,'##AuditColumns##', (
-	 with date_cols as (
-		select i_insert_date_name as col_name where i_insert_date_name is not null
-		union select i_update_date_name as col_name where i_update_date_name is not null
-		union select I_UPDATE_BY_NAME as col_name where I_UPDATE_BY_NAME is not null
-		union select I_INSERT_BY_NAME as col_name where I_INSERT_BY_NAME is not null
-		union select 'ROW_INSERT_DATE' as col_name  where I_INSERT_DATE_NAME is null
-		union select 'ROW_UPDATE_DATE' as col_name  where I_UPDATE_DATE_NAME is null
-		union select 'ROW_UPDATE_BY' as col_name  where I_UPDATE_BY_NAME is null
-		union select 'ROW_INSERT_BY' as col_name  where I_INSERT_BY_NAME is null
-		order by col_name
-		)
-	select string_agg(col_name,
-			',' || chr(13) || chr(10) ) from date_cols
-	 ));
-	 
- 	
    raise notice 'Insert SQL %', V_INSERT_TEMPLATE;
  	execute V_INSERT_TEMPLATE;
  	GET DIAGNOSTICS O_INSERT_COUNT = ROW_COUNT;
